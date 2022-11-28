@@ -1,6 +1,6 @@
-use std::{collections::HashMap, mem::take};
+use std::mem::take;
 
-use crate::{files::{cache, load}, commands::{download, unzip}};
+use crate::{files::{cache, load}, commands::{download, unzip}, random_state::RandomState};
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -58,6 +58,22 @@ impl ValueVec {
             ValueVec::Str(vec) => vec.push(elem.and_then(Value::str)),
         }
     }
+
+    pub fn swap(&mut self, a: usize, b: usize) {
+        match self {
+            ValueVec::Int(vec) => vec.swap(a, b),
+            ValueVec::Float(vec) => vec.swap(a, b),
+            ValueVec::Str(vec) => vec.swap(a, b),
+        }
+    }
+
+    pub fn split_off(&mut self, at: usize) -> Self {
+        match self {
+            ValueVec::Int(vec) => ValueVec::Int(vec.split_off(at)),
+            ValueVec::Float(vec) => ValueVec::Float(vec.split_off(at)),
+            ValueVec::Str(vec) => ValueVec::Str(vec.split_off(at)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,9 +85,11 @@ pub enum Kind {
 
 #[derive(Debug, Clone)]
 pub struct Dataset {
-    name: String,
-    schema: Vec<(String, Kind)>,
-    data: Vec<ValueVec>,
+    pub name: String,
+    pub schema: Vec<(String, Kind)>,
+    pub data: Vec<ValueVec>,
+    pub train: bool,
+    pub has_target: bool,
 }
 
 impl Dataset {
@@ -93,10 +111,10 @@ impl Dataset {
         unzip(&file, &data_dir);
     }
 
-    pub fn load(name: String) -> Self {
-        Self::download(&name);
+    pub fn load(dataset_name: &str, file_name: &str) -> Self {
+        Self::download(dataset_name);
         
-        let train = load(&name).join("train.csv");
+        let train = load(dataset_name).join(file_name);
 
         let mut reader =  csv::Reader::from_path(train).unwrap();
 
@@ -172,10 +190,37 @@ impl Dataset {
         }
 
         Self {
-            name,
+            name: dataset_name.to_string(),
             schema,
             data,
+            train: file_name == "train.csv",
+            has_target: file_name == "train.csv",
         }
+    } 
+
+    pub fn load_test(name: &str) -> Self {
+        Self::load(name, "test.csv")
+    }
+
+    pub fn load_train(name: &str) -> Self {
+        Self::load(name, "train.csv")
+    }
+
+    pub fn set_target(&mut self, target: &str) {
+        if self.has_target {
+            for (i, col) in self.schema.iter().enumerate() {
+                if &col.0 == target {
+                    let len = self.schema.len();
+                    self.schema.swap(i, len - 1);
+                    self.data.swap(i, len - 1);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn target(&self) -> ValueVec {
+        self.data.last().unwrap().clone()
     }
 
     pub fn remove_nones(&mut self) {
@@ -240,7 +285,57 @@ impl Dataset {
         }
     }
 
-    pub fn embed() -> (u32, u32, Box<[f64]>) {
-        todo!()
+    pub fn split(mut self, test_size: Option<f64>, train_size: Option<f64>, random_state: &mut RandomState) -> (Self, Self) {
+        assert!(self.train, "you can't split test dataset");
+
+        let len = self.len();
+
+        let test = match (test_size, train_size) {
+            (Some(test), _) => {
+                if test < 1.0 {
+                    (len as f64 * test) as usize
+                } else {
+                    test as usize
+                }
+            },
+            (_, Some(train)) => {
+                if train < 1.0 {
+                    (len as f64 * (1.0 - train)) as usize
+                } else {
+                    len - train as usize
+                }
+            },
+            _ => {
+                len * 7 / 10
+            },
+        };
+
+        for i in 0..test {
+            let index = random_state.gen() % (len - i);
+            for col in self.data.iter_mut() {
+                col.swap(index, len - i - 1);
+            }
+        }
+
+
+        let train = len - test;
+
+        let mut new_data = Vec::new();
+        for col in self.data.iter_mut() {
+            new_data.push(col.split_off(train));
+        }
+
+        let name = self.name;
+        self.name = name.clone() + "_train";
+        
+        let test = Self {
+            name: name + "_test",
+            schema: self.schema.clone(),
+            data: new_data,
+            train: false,
+            has_target: self.has_target,
+        };
+
+        (self, test)
     }
 }
